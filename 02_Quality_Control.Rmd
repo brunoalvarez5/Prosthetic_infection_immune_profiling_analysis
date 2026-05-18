@@ -1,0 +1,600 @@
+---
+title: 'Quaity Control: Prosthetic Infection Immune Profiling'
+author: "Bruno Álvarez"
+date: "2026-05-14"
+output:
+  pdf_document: 
+    toc: true
+    number_sections: true
+    latex_engine: xelatex
+  geometry: margin=1n
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 8,
+  fig.height = 5
+)
+
+library(tidyverse)
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(janitor)
+library(ggplot2)
+library(skimr)
+library(naniar)
+library(knitr)
+library(kableExtra)
+library(here)
+library(writexl)
+library(pheatmap)
+library(ggrepel)
+library(broom)
+```
+
+Quality control of the data to clean it and leave it prepared
+
+The first step is to map the objects, confirm provenance, identify true FlowSOM frequency columns, then QC missingness and compositional integrity.
+
+Lets start by loading the datasets
+```{r}
+Trauma_data <- read.csv("/home/bruno/Academia/Master/TFM/proyecto_Trauma/resultados/Data/Trauma_analysis_dataset.csv")
+MC_markers <- read.csv("/home/bruno/Academia/Master/TFM/proyecto_Trauma/resultados/Data/MC_markers.csv")
+```
+
+Lets take a look at them now
+```{r}
+dim(Trauma_data)
+colnames(Trauma_data)
+glimpse(Trauma_data)
+```
+
+```{r}
+dim(MC_markers)
+colnames(MC_markers)
+glimpse(MC_markers)
+```
+
+load the frequencies and markers from the excel to backtrack check
+```{r}
+excel_frequencies <- read_excel(
+  here("Data", "Trauma_FlowSOM_Report.xlsx"),
+  sheet = "MC Frequencies (%)"
+) %>%
+  clean_names() %>%
+  mutate(patient = if_else(patient == "P71", "P1", patient)) %>%
+  rename(codigo_interno = patient)
+
+excel_markers <- read_excel(
+  here("Data", "Trauma_FlowSOM_Report.xlsx"),
+  sheet = "MC Marker Profiles"
+) %>%
+  clean_names()
+```
+
+before analysis the main issue is the duplicated columns:
+nombre.x
+nombre.y
+nhc.x
+nhc.y
+vsg_mm_h.x
+vsg_mm_h.y
+crp_serum_mg_d_l.x
+crp_serum_mg_d_l.y
+d_dimero_plasma_mcg_l_feu.x
+d_dimero_plasma_mcg_l_feu.y
+
+Lets compare the duplicate columns
+```{r}
+compare_duplicate_columns <- function(df, x_col, y_col) {
+  tibble(
+    codigo_interno = df$codigo_interno,
+    x = df[[x_col]],
+    y = df[[y_col]],
+    both_missing = is.na(x) & is.na(y),
+    same_value = x == y | both_missing
+  ) %>%
+    filter(!same_value | is.na(same_value))
+}
+
+compare_duplicate_columns(Trauma_data, "nombre.x", "nombre.y")
+compare_duplicate_columns(Trauma_data, "nhc.x", "nhc.y")
+compare_duplicate_columns(Trauma_data, "vsg_mm_h.x", "vsg_mm_h.y")
+compare_duplicate_columns(Trauma_data, "crp_serum_mg_d_l.x", "crp_serum_mg_d_l.y")
+compare_duplicate_columns(Trauma_data, "d_dimero_plasma_mcg_l_feu.x", "d_dimero_plasma_mcg_l_feu.y")
+```
+
+Now just keep the existing value into a common column and delete the previous two
+```{r}
+analysis_clean <- Trauma_data %>%
+  mutate(
+    nombre = coalesce(`nombre.x`, `nombre.y`),
+    nhc = coalesce(`nhc.x`, `nhc.y`),
+    vsg_mm_h = coalesce(`vsg_mm_h.x`, `vsg_mm_h.y`),
+    crp_serum_mg_d_l = coalesce(`crp_serum_mg_d_l.x`, `crp_serum_mg_d_l.y`),
+    d_dimero_plasma_mcg_l_feu = coalesce(
+      `d_dimero_plasma_mcg_l_feu.x`,
+      `d_dimero_plasma_mcg_l_feu.y`
+    )
+  ) %>%
+  select(
+    -`nombre.x`, -`nombre.y`,
+    -`nhc.x`, -`nhc.y`,
+    -`vsg_mm_h.x`, -`vsg_mm_h.y`,
+    -`crp_serum_mg_d_l.x`, -`crp_serum_mg_d_l.y`,
+    -`d_dimero_plasma_mcg_l_feu.x`, -`d_dimero_plasma_mcg_l_feu.y`
+  )
+```
+
+check how the data set changed
+```{r}
+dim(analysis_clean)
+colnames(analysis_clean)
+glimpse(analysis_clean)
+```
+
+There are lots of useles columns missing values in all the patients, these columns provide no information so we are proceding to delete them.
+the empty ones are:
+
+peso
+altura
+recuento_celular
+f_rmula_leucocitaria
+cultivo_de_liquido_sinovial
+niveles_de_alfa_defensina
+resultado_del_analisis_de_corte_congelado
+resultados_de_cultivos_de_tejido
+confirmacion_microbiologica
+microorganismo_identificado
+
+```{r}
+missing_overview <- analysis_clean %>%
+  summarise(across(
+    everything(),
+    ~ sum(is.na(.)),
+    .names = "{.col}"
+  )) %>%
+  pivot_longer(
+    everything(),
+    names_to = "variable",
+    values_to = "n_missing"
+  ) %>%
+  mutate(
+    pct_missing = 100 * n_missing / nrow(analysis_clean)
+  ) %>%
+  arrange(desc(pct_missing))
+
+missing_overview
+```
+
+```{r}
+all_missing_cols <- missing_overview %>%
+  filter(pct_missing == 100) %>%
+  pull(variable)
+
+all_missing_cols
+```
+
+```{r}
+analysis_qc <- analysis_clean %>%
+  select(-all_of(all_missing_cols))
+```
+
+Now lets check whether metacluster frequencies sum to 100%, but first see wich columns are from mc frequencies
+```{r}
+mc_frequency_cols <- setdiff(
+  colnames(excel_frequencies),
+  c("codigo_interno", "cluster")
+)
+
+mc_frequency_cols
+
+length(mc_frequency_cols)
+
+all(mc_frequency_cols %in% colnames(analysis_qc))
+
+setdiff(mc_frequency_cols, colnames(analysis_qc))
+```
+
+lets check if the metacluster frequencies sum up to 100%
+```{r}
+analysis_qc <- analysis_qc %>%
+  mutate(
+    mc_frequency_sum = rowSums(across(all_of(mc_frequency_cols)), na.rm = TRUE),
+    mc_frequency_sum_deviation = mc_frequency_sum - 100
+  )
+
+analysis_qc %>%
+  select(codigo_interno, mc_frequency_sum, mc_frequency_sum_deviation) %>%
+  arrange(desc(abs(mc_frequency_sum_deviation)))
+```
+Plot the results for a better visualitzation
+```{r}
+analysis_qc %>%
+  ggplot(aes(
+    x = reorder(codigo_interno, mc_frequency_sum),
+    y = mc_frequency_sum
+  )) +
+  geom_col() +
+  geom_hline(yintercept = 100, linetype = "dashed") +
+  coord_flip() +
+  labs(
+    title = "QC: Sum of FlowSOM metacluster frequencies per patient",
+    x = "Patient",
+    y = "Sum of metacluster frequencies (%)"
+  )
+```
+
+After removing useless all-missing variables, what missingness remains in the actual working analysis table?
+```{r}
+missing_overview_qc <- analysis_qc %>%
+  summarise(across(
+    everything(),
+    ~ sum(is.na(.)),
+    .names = "{.col}"
+  )) %>%
+  pivot_longer(
+    everything(),
+    names_to = "variable",
+    values_to = "n_missing"
+  ) %>%
+  mutate(
+    pct_missing = round(100 * n_missing / nrow(analysis_qc), 2)
+  ) %>%
+  arrange(desc(pct_missing), variable)
+
+missing_overview_qc
+```
+From this info we can extract that "d_dimero_plasma_mcg_l_feu" and  "hb_glicosilada_hb_a1c_percent" variables are not suitable for formal association testing due to high missingness. We will retain "detalle_intervenciones" just as a descriptive field. And "vitamina_d_25_hidroxi_ng_m_l" will be kept but only used as exploratory data. It can be use to describe, maybe plot, but any association with immune populations would be very weak.
+
+The variables found in the 33.33% (10 patients only) missingness can be used but models will have small sample sizes. It would be rather preferable to only use them as descriptive summaries, scatterplots/boxplots, FDR corrections, and to not extract any strong claims from them.
+
+Finally the rest of the varariables that less than 33.33 missignes are the better candidates for association testing.
+
+Creating a table to take decisions on variable usage
+```{r}
+variable_qc_decisions <- missing_overview_qc %>%
+  mutate(
+    recommended_use = case_when(
+      pct_missing == 100 ~ "Exclude: no observed data",
+      pct_missing > 50 ~ "Descriptive only / exclude from formal models",
+      pct_missing > 20 & pct_missing <= 50 ~ "Exploratory analysis only",
+      pct_missing > 0 & pct_missing <= 20 ~ "Usable with caution",
+      pct_missing == 0 ~ "Usable"
+    )
+  ) %>%
+  arrange(desc(pct_missing), variable)
+
+variable_qc_decisions %>%
+  print(n = Inf)
+```
+
+
+```{r}
+missing_overview_qc %>%
+  arrange(desc(pct_missing), variable) %>%
+  print(n = Inf)
+```
+
+Missingness was concentrated in selected clinical and biochemical variables. All remaining variables, including the FlowSOM metacluster frequency variables, had 0% missingness in the final analysis dataset. Given the small cohort size (n = 15), missingness was interpreted cautiously because each missing observation corresponds to 6.67% of the cohort. And mainly as exploratory.
+
+Before proceding we can obvserve that variables like imc have 0% missignes but only contain "#DIV/0!", which is an excel error message and is hterefore all NA. The same hapens with "ac_ig_m_veb_ea", since all its values are "No procede" it has no analytical variation.
+In addition to this "nombre", "nhc", "fecha_de_nacimiento", "descripcion" y "cultivos" are identifiers or text heavy clinical descriptions. These are useful for traceability or manual annotation but not useful for statistical tests.
+
+The following table will store what roles each variable can better perform
+```{r}
+variable_roles <- tibble(
+  variable = colnames(analysis_qc),
+  role = case_when(
+    variable %in% c("codigo_interno", "nombre", "nhc") ~ "Identifier / traceability only",
+    variable %in% c("fecha_de_nacimiento") ~ "Date / traceability only",
+    variable %in% c("descripcion", "cultivos", "detalle_intervenciones") ~ "Free-text clinical annotation",
+    variable %in% mc_frequency_cols ~ "FlowSOM metacluster frequency",
+    variable %in% c("cluster") ~ "FlowSOM-derived patient cluster/group",
+    variable %in% c("mc_frequency_sum", "mc_frequency_sum_deviation") ~ "QC-derived variable",
+    variable %in% c(
+      "edad",
+      "numero_intervenciones_n",
+      "hemoglobina_g_dl",
+      "hematocrito_percent",
+      "vcm_f_l",
+      "leucocitos_ml_mmc",
+      "neutrofilos_percent",
+      "linfocitos_percent",
+      "vsg_mm_h",
+      "crp_serum_mg_d_l",
+      "d_dimero_plasma_mcg_l_feu",
+      "filtrado_glomerular_m_l_min",
+      "proteinas_totales_g_d_l",
+      "albumina_g_d_l",
+      "prealbumina_mg_d_l",
+      "hb_glicosilada_hb_a1c_percent",
+      "vitamina_d_25_hidroxi_ng_m_l",
+      "il5_pg_m_l",
+      "il6_pg_m_l",
+      "il10_pg_m_l"
+    ) ~ "Numeric clinical/biochemical variable",
+    TRUE ~ "Categorical clinical variable"
+  )
+)
+
+variable_roles %>%
+  arrange(role, variable) %>%
+  print(n = Inf)
+```
+
+
+```{r}
+low_variation_vars <- analysis_qc %>%
+  summarise(across(
+    everything(),
+    ~ n_distinct(., na.rm = TRUE),
+    .names = "{.col}"
+  )) %>%
+  pivot_longer(
+    everything(),
+    names_to = "variable",
+    values_to = "n_unique_non_missing"
+  ) %>%
+  arrange(n_unique_non_missing, variable)
+
+low_variation_vars %>%
+  print(n = Inf)
+```
+
+fixing "imc"
+```{r}
+analysis_qc <- analysis_qc %>%
+  mutate(
+    imc_original = imc,
+    imc_numeric = suppressWarnings(as.numeric(imc)),
+    imc_numeric = if_else(is.nan(imc_numeric), NA_real_, imc_numeric)
+  )
+```
+
+```{r}
+analysis_qc %>%
+  select(codigo_interno, imc_original, imc_numeric)
+```
+
+```{r}
+# Identify columns that are 100% missing
+all_na_cols <- analysis_qc %>%
+  summarise(across(everything(), ~ all(is.na(.)))) %>%
+  pivot_longer(
+    everything(),
+    names_to = "variable",
+    values_to = "all_na"
+  ) %>%
+  filter(all_na) %>%
+  pull(variable)
+
+all_na_cols
+```
+
+```{r}
+analysis_qc <- analysis_qc %>%
+  select(-all_of(all_na_cols))
+```
+
+```{r}
+analysis_qc %>%
+  summarise(across(everything(), ~ all(is.na(.)))) %>%
+  pivot_longer(
+    everything(),
+    names_to = "variable",
+    values_to = "all_na"
+  ) %>%
+  filter(all_na)
+```
+
+```{r}
+low_variation_vars %>%
+  print(n = Inf)
+
+variable_roles %>%
+  arrange(role, variable) %>%
+  print(n = Inf)
+
+```
+With the quality cotrol done I proceed to save the outputs
+```{r}
+saveRDS(
+  analysis_qc,
+  here("Data", "processed", "atlas_inputs", "analysis_qc_identifiable.rds")
+)
+
+write.csv(
+  analysis_qc,
+  here("Data", "processed", "atlas_inputs", "analysis_qc_identifiable.csv"),
+  row.names = FALSE
+)
+```
+
+```{r}
+privacy_cols <- intersect(
+  c("nombre", "nhc", "fecha_de_nacimiento", "descripcion"),
+  colnames(analysis_qc)
+)
+
+analysis_qc_deidentified <- analysis_qc %>%
+  select(-all_of(privacy_cols))
+
+saveRDS(
+  analysis_qc_deidentified,
+  here("Data", "processed", "atlas_inputs", "analysis_qc_deidentified.rds")
+)
+
+write.csv(
+  analysis_qc_deidentified,
+  here("Data", "processed", "atlas_inputs", "analysis_qc_deidentified.csv"),
+  row.names = FALSE
+)
+
+```
+
+```{r}
+saveRDS(
+  MC_markers,
+  here("Data", "processed", "atlas_inputs", "mc_marker_profiles.rds")
+)
+
+write.csv(
+  MC_markers,
+  here("Data", "processed", "atlas_inputs", "mc_marker_profiles.csv"),
+  row.names = FALSE
+)
+```
+
+```{r}
+saveRDS(
+  mc_frequency_cols,
+  here("Data", "processed", "atlas_inputs", "mc_frequency_cols.rds")
+)
+
+writeLines(
+  mc_frequency_cols,
+  here("Data", "processed", "atlas_inputs", "mc_frequency_cols.txt")
+)
+```
+
+```{r}
+saveRDS(
+  mc_frequency_cols,
+  here("Data", "processed", "atlas_inputs", "mc_frequency_cols.rds")
+)
+
+writeLines(
+  mc_frequency_cols,
+  here("Data", "processed", "atlas_inputs", "mc_frequency_cols.txt")
+)
+```
+
+```{r}
+mc_frequency_matrix <- analysis_qc_deidentified %>%
+  select(codigo_interno, all_of(mc_frequency_cols))
+
+saveRDS(
+  mc_frequency_matrix,
+  here("Data", "processed", "atlas_inputs", "mc_frequency_matrix.rds")
+)
+
+write.csv(
+  mc_frequency_matrix,
+  here("Data", "processed", "atlas_inputs", "mc_frequency_matrix.csv"),
+  row.names = FALSE
+)
+```
+
+```{r}
+patient_metadata <- analysis_qc_deidentified %>%
+  select(
+    codigo_interno,
+    edad,
+    sexo,
+    lugar_de_infeccion,
+    lateralidad,
+    tipo_de_infeccion,
+    numero_intervenciones_n,
+    cluster,
+    vsg_mm_h,
+    crp_serum_mg_d_l,
+    hemoglobina_g_dl,
+    leucocitos_ml_mmc,
+    neutrofilos_percent,
+    linfocitos_percent,
+    il5_pg_m_l,
+    il6_pg_m_l,
+    il10_pg_m_l,
+    albumina_g_d_l,
+    prealbumina_mg_d_l
+  )
+
+saveRDS(
+  patient_metadata,
+  here("Data", "processed", "atlas_inputs", "patient_metadata.rds")
+)
+
+write.csv(
+  patient_metadata,
+  here("Data", "processed", "atlas_inputs", "patient_metadata.csv"),
+  row.names = FALSE
+)
+```
+
+```{r}
+saveRDS(
+  missing_overview_qc,
+  here("Data", "processed", "atlas_inputs", "missing_overview_qc.rds")
+)
+
+saveRDS(
+  low_variation_vars,
+  here("Data", "processed", "atlas_inputs", "low_variation_vars.rds")
+)
+
+saveRDS(
+  variable_roles,
+  here("Data", "processed", "atlas_inputs", "variable_roles.rds")
+)
+
+write.csv(
+  missing_overview_qc,
+  here("Data", "processed", "atlas_inputs", "missing_overview_qc.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  low_variation_vars,
+  here("Data", "processed", "atlas_inputs", "low_variation_vars.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  variable_roles,
+  here("Data", "processed", "atlas_inputs", "variable_roles.csv"),
+  row.names = FALSE
+)
+```
+
+```{r}
+saveRDS(
+  variable_qc_decisions,
+  here("Data", "processed", "atlas_inputs", "variable_qc_decisions.rds")
+)
+
+write.csv(
+  variable_qc_decisions,
+  here("Data", "processed", "atlas_inputs", "variable_qc_decisions.csv"),
+  row.names = FALSE
+)
+```
+
+```{r}
+atlas_input_bundle <- list(
+  analysis_qc_deidentified = analysis_qc_deidentified,
+  MC_markers = MC_markers,
+  mc_frequency_cols = mc_frequency_cols,
+  mc_frequency_matrix = mc_frequency_matrix,
+  patient_metadata = patient_metadata,
+  missing_overview_qc = missing_overview_qc,
+  low_variation_vars = low_variation_vars,
+  variable_roles = variable_roles,
+  session_info = sessionInfo()
+)
+
+saveRDS(
+  atlas_input_bundle,
+  here("Data", "processed", "atlas_inputs", "trauma_immune_atlas_input_bundle.rds")
+)
+```
+

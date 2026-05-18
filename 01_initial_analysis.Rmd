@@ -1,0 +1,363 @@
+---
+title: 'Initial Data Inspection: Prosthetic Infection Immune Profiling'
+author: "Bruno Álvarez"
+date: "2026-05-12"
+output:
+  pdf_document: 
+    toc: true
+    number_sections: true
+    latex_engine: xelatex
+  geometry: margin=1n
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load libraries, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 8,
+  fig.height = 5
+)
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(janitor)
+library(ggplot2)
+library(skimr)
+library(naniar)
+library(knitr)
+library(kableExtra)
+library(here)
+library(writexl)
+```
+
+The aim of this first report is to do an initial inspection and a sanity check to fix errors on the data set to ensure it is usable for a proper analysis. THe analysis will be performed on the clinical databases and the FlowSOM output database
+
+Main objectives to verify:
+- Available Excel sheets
+- Structure of the FlowSOM metacluster frequency table
+- Structure of the metacluster marker profile table
+- Structure of the clinical database
+- Look for the sample identifiers
+- Initial missigness patterns
+- Feasibility of building a merged clinical-immune master table
+
+
+Storing the file paths
+```{r file-paths}
+flowsom_file <- here("Data", "Trauma_FlowSOM_Report.xlsx")
+clinical_file <- here("Data", "Estuido_Inmunidad_DB.xlsx")
+
+flowsom_file
+clinical_file
+```
+
+Overviewing datasets
+```{r excel-sheet-overview}
+flowsom_sheets <- excel_sheets(flowsom_file)
+clinical_sheets <- excel_sheets(clinical_file)
+
+flowsom_sheets
+clinical_sheets
+```
+
+Loading the datasets
+```{r dataset-loading}
+clinical_demografics <- read_excel(clinical_file, sheet = "DemográficosClínicos", skip = 1)
+clinical_bioq <- read_excel(clinical_file, sheet = "Bioquímicas", skip = 1)
+clinical_immune <- read_excel(clinical_file, sheet = "Principales (Inmunidad)")
+```
+
+Cleaning each dataset columns
+```{r dataset-column-cleaning}
+clinical_demo_clean <- clinical_demografics %>% clean_names()
+clinical_bioq_clean <- clinical_bioq %>% clean_names()
+clinical_immune_clean <- clinical_immune %>% clean_names()
+```
+
+Proceeding to inspect the different clinical data sets, however I stop paying attention to the clinical Immune one because its just the FlowSOM data set wrongly organized and stored
+
+Inspecting dimensions
+```{r inspecting-the-dimensions-on-the-clinical-datasets}
+dim(clinical_demo_clean)
+dim(clinical_bioq_clean)
+dim(clinical_immune_clean)
+```
+
+checking the column names
+```{r checking-colnames}
+print("- DEMOGRAFICS COLUMN NAMES")
+colnames(clinical_demo_clean)
+print("- BIOQUIMICA COLUMN NAMES")
+colnames(clinical_bioq_clean)
+```
+
+taking a look at the first rows as examples
+```{r cheacking-first-rows}
+head(clinical_demo_clean)
+head(clinical_bioq_clean)
+```
+
+The patient ID column is called "codigo_interno" so first I will double check it
+
+```{r checking-patient-id}
+"codigo_interno" %in% colnames(clinical_demo_clean)
+"codigo_interno" %in% colnames(clinical_bioq_clean)
+```
+
+Taking a look at some of the IDs
+```{r head-check}
+clinical_demo_clean %>%
+  select(codigo_interno) %>%
+  head(20)
+
+clinical_bioq_clean %>%
+  select(codigo_interno) %>%
+  head(20)
+
+```
+
+Checking all the rows to look for repeated IDs or rows with missing ID
+```{r repeated-and-missing-id-sanity-check}
+clinical_demo_clean %>%
+  summarise(
+    rows = n(),
+    unique_ids = n_distinct(codigo_interno),
+    missing_ids = sum(is.na(codigo_interno))
+  )
+
+clinical_bioq_clean %>%
+  summarise(
+    rows = n(),
+    unique_ids = n_distinct(codigo_interno),
+    missing_ids = sum(is.na(codigo_interno))
+  )
+```
+
+Double checking for duplicates in the IDs
+```{r doublle-check-for-duplicates}
+clinical_demo_clean %>%
+  count(codigo_interno) %>%
+  filter(n > 1)
+
+clinical_bioq_clean %>%
+  count(codigo_interno) %>%
+  filter(n > 1)
+```
+
+Checking if all patients in demografics are in bioquimica
+
+this will show patients in DemograficosClínicos but not in Bioquímicas
+```{r checking-if-patients-match}
+clinical_demo_clean %>%
+  anti_join(clinical_bioq_clean, by = "codigo_interno")
+```
+This will show patients in "Bioquímicas" but not in "DemograficosClínicos"
+```{r}
+clinical_bioq_clean %>%
+  anti_join(clinical_demo_clean, by = "codigo_interno")
+```
+
+Since in both cases there is no table generated it means they 100% match
+
+Taking a look now at the types of variables
+```{r checking-variable-types}
+str(clinical_demo_clean)
+str(clinical_bioq_clean)
+```
+
+```{r checking-variable-types-clean}
+glimpse(clinical_demo_clean)
+glimpse(clinical_bioq_clean)
+```
+
+We can see that the variable "numero_de_intervenciones" is suposed to be just numbers but its a "chr" type variable instead of a "dbl" type variable, this is because in some cases not only the number is listed but also the type of interventions. Therefore I thought of the solution to preserve that column but also generate two derivates one containing just the number and anotherone containing the types of interventions.
+
+```{r interventions-reframed}
+clinical_demo_clean <- clinical_demo_clean %>%
+  mutate(
+    numero_de_intervenciones_original = numero_de_intervenciones,
+    
+    numero_intervenciones_n = str_extract(
+      numero_de_intervenciones,
+      "^\\d+(\\.\\d+)?"
+    ) %>%
+      as.numeric(),
+    
+    detalle_intervenciones = str_extract(
+      numero_de_intervenciones,
+      "\\(.*\\)"
+    ) %>%
+      str_remove_all("^\\(|\\)$") %>%
+      str_squish()
+  )
+```
+
+vhecking if the reframed worked
+```{r checking}
+clinical_demo_clean %>%
+  select(
+    codigo_interno,
+    numero_de_intervenciones_original,
+    numero_intervenciones_n,
+    detalle_intervenciones
+  ) %>%
+  head(20)
+```
+
+Due to the format of the excel there was a column name lost, the column "x10" should be called "Variables principales (inmunofenotipo)"
+```{r renaming column}
+clinical_demo_clean <- clinical_demo_clean %>% rename(Variables_principales_inmunofenotipo = x10)
+```
+
+checking if it worked
+```{r checking column}
+glimpse(clinical_demo_clean)
+```
+
+Now that the clinical data has passed a sanity check we can create a master clinical data
+```{r joining-clinical-datasets}
+clinical_master <- clinical_demo_clean %>%
+  full_join(clinical_bioq_clean, by = "codigo_interno")
+```
+
+checking how the joined dataset looks
+```{r checking-the-joined-dataset}
+dim(clinical_master)
+
+clinical_master %>%
+  select(codigo_interno) %>%
+  summarise(
+    rows = n(),
+    unique_ids = n_distinct(codigo_interno),
+    missing_ids = sum(is.na(codigo_interno))
+  )
+```
+
+Now lets save the dataset into a CSV file
+```{r saving-master-clinical-dataset}
+dir.create(here("data", "processed"), showWarnings = FALSE, recursive = TRUE)
+
+write.csv(
+  clinical_master,
+  here("data", "processed", "clinical_master_preliminary.csv"),
+  row.names = FALSE
+)
+```
+
+
+Proceding to import the FlowSOM database, with a database for each of its sheets ("MC Frequencies (%)" "MC Marker Profiles" "Methods"). However, I exclude the "Methods" database since its just a docs file emptied into an excel file
+```{r importing FlowSOM}
+MC_frequencies <- read_excel(flowsom_file, sheet = "MC Frequencies (%)", skip = 0)
+MC_markers <- read_excel(flowsom_file, sheet = "MC Marker Profiles", skip = 0)
+```
+
+Cleaning the column names
+```{r clean flowsom dataset}
+MC_frequencies_clean <- MC_frequencies %>% clean_names()
+MC_markers_clean <- MC_markers %>% clean_names()
+```
+
+Inspecting dimensions
+```{r dim}
+dim(MC_frequencies_clean)
+dim(MC_markers_clean)
+```
+
+```{r}
+colnames(MC_frequencies_clean)
+colnames(MC_markers_clean)
+```
+
+```{r}
+head(MC_frequencies_clean)
+head(MC_markers_clean)
+```
+
+Sample "71" is actually the sample "1" so its name should be changed from "P71" to "P1" in MC_frequencies_clean dataset
+```{r renaming sample 71}
+MC_frequencies_clean <- MC_frequencies_clean %>%
+  mutate(patient = if_else(patient == "P71", "P1", patient))
+```
+
+lets check if it changed successfully
+```{r checking changed id}
+print(MC_frequencies_clean$patient)
+
+a <- FALSE
+for (x in MC_frequencies_clean$patient) {
+  if (x == "P71"){
+    print("changed unsuccessfully")
+  }
+  else {
+    a <- TRUE
+  }
+}
+```
+
+Since the column joining datasets is named "codigo_interno" we change the column name "patient" in "MC_frequencies_clean" to "codigo_interno"
+```{r renaming id column}
+MC_frequencies_clean <- MC_frequencies_clean %>% rename(codigo_interno = patient)
+```
+
+CHecking if it changed properly
+```{r column change check}
+glimpse(MC_frequencies_clean)
+```
+
+With the MC_frequencies data set checked we proceed to join all the data together, leaving it ready for a primary analysis analysis
+```{r}
+Trauma_dataset <- clinical_master %>%
+  full_join(MC_frequencies_clean, by = "codigo_interno")
+```
+
+
+Checking the joined data set
+```{r}
+dim(Trauma_dataset)
+
+Trauma_dataset %>%
+  select(codigo_interno) %>%
+  summarise(
+    rows = n(),
+    unique_ids = n_distinct(codigo_interno),
+    missing_ids = sum(is.na(codigo_interno))
+  )
+```
+There is a patient from which there was no sample, consequently it has no immunological data, due to that I will preserve it in the Trauma data set but will create a new data set excluding it for the analysis
+```{r}
+Trauma_analysis_dataset <- Trauma_dataset %>% slice(-5)
+```
+
+Checking if it worked
+```{r}
+dim(Trauma_dataset)
+dim(Trauma_analysis_dataset)
+```
+
+Storing both data sets into a csv file
+```{r}
+write.csv(
+  Trauma_dataset,
+  here("Data", "Trauma_dataset.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  Trauma_analysis_dataset,
+  here("Data", "Trauma_analysis_dataset.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  MC_markers_clean,
+  here("Data", "MC_markers.csv"),
+  row.names = FALSE
+)
+```

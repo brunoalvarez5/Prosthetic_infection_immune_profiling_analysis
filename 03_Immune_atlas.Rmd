@@ -1,0 +1,515 @@
+---
+title: 'Creation of FlowSOM immune atlas: Prosthetic Infection Immune Profiling'
+author: "Bruno Álvarez"
+date: "2026-05-14"
+output:
+  pdf_document: 
+    toc: true
+    number_sections: true
+    latex_engine: xelatex
+  geometry: margin=1n
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 8,
+  fig.height = 5
+)
+
+library(tidyverse)
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(janitor)
+library(ggplot2)
+library(skimr)
+library(naniar)
+library(knitr)
+library(kableExtra)
+library(here)
+library(writexl)
+library(pheatmap)
+library(ggrepel)
+library(broom)
+```
+
+The goal of the immune atlas is to properly describe the immune landscape reported by FlowSOM meta clusters, biologically annotated those meta clusters, and visualize how the 15 patients distribute across those different immune states.
+The main objectives that this report wants to achieve are the following ones:
+- Portray what immune populations did FlowSOM identify
+- Identify what marker patterns define each meta cluster
+- How metaclusters look like at a cellular level
+- How abundant is each population across the different patients
+- And answer if patients show broad immune-profile structure
+
+
+First step, loading the data saved in the QC section
+```{r}
+bundle <- readRDS("Data/processed/atlas_inputs/trauma_immune_atlas_input_bundle.rds")
+```
+
+```{r}
+names(bundle)
+```
+
+```{r}
+#extract objects
+analysis_qc_deidentified <- bundle$analysis_qc_deidentified
+mc_marker_profiles       <- bundle$MC_markers
+mc_frequency_cols        <- bundle$mc_frequency_cols
+mc_frequency_matrix      <- bundle$mc_frequency_matrix
+patient_metadata         <- bundle$patient_metadata
+missing_overview_qc      <- bundle$missing_overview_qc
+low_variation_vars       <- bundle$low_variation_vars
+variable_roles           <- bundle$variable_roles
+```
+
+```{r}
+dim(analysis_qc_deidentified)
+dim(mc_marker_profiles)
+length(mc_frequency_cols)
+dim(mc_frequency_matrix)
+dim(patient_metadata)
+```
+
+We proceed to creat a heatmap for the for the 20 meta clusters in respect to the patients.
+
+First creating an specific table to plot the heatmap
+```{r}
+patient_immune_tbl <- analysis_qc_deidentified %>%
+  as_tibble() %>%
+  mutate(
+    patient_row_id = row_number(),
+    patient_plot_id = paste0("P", stringr::str_pad(patient_row_id, width = 2, pad = "0"))
+  ) %>%
+  select(
+    patient_row_id,
+    patient_plot_id,
+    cluster,
+    all_of(mc_frequency_cols)
+  )
+
+patient_immune_tbl
+```
+
+Transforming the immune table into long format
+```{r}
+patient_mc_long <- patient_immune_tbl %>%
+  pivot_longer(
+    cols = all_of(mc_frequency_cols),
+    names_to = "metacluster",
+    values_to = "frequency"
+  ) %>%
+  mutate(
+    cluster = as.factor(cluster)
+  )
+
+head(patient_mc_long)
+```
+Ploting the raw frequencie heatmap (Patient x FlowSOM metacluster frequency heatmap), patients being frouped by the FlowSOM derived patient cluster.
+
+```{r, fig.crop=FALSE}
+ggplot(patient_mc_long, aes(x = metacluster, y = patient_plot_id, fill = frequency)) +
+  geom_tile(color = "white", linewidth = 0.2) +
+  facet_grid(cluster ~ ., scales = "free_y", space = "free_y") +
+  labs(
+    x = "Metacluster",
+    y = "Patient",
+    fill = "Frequency (%)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1),
+    panel.grid = element_blank(),
+    plot.margin = margin(t = 25, r = 0, b = 0, l = 0)
+    
+  )
+```
+
+In the raw patient × metacluster frequency heatmap, most metaclusters show very low frequencies across patients. Cluster 1 appears characterized by higher abundance of cd8_tem_ra_cd57dim_senescent. Cluster 2 shows an attenuated abundance of this metacluster and relatively higher abundance of cd4_naive_ccr7hi_cd27_cd28. Cluster 3 contains only one patient and appears as a single-patient outlier profile, dominated by cd4dim_pd1hi_tim3hi_exhausted.
+
+In order to not rely entirely on the heatmap now we are going to quantify metacluster frequencies by FlowSOM patient cluster
+```{r}
+cluster_mc_summary <- patient_mc_long %>%
+  group_by(cluster, metacluster) %>%
+  summarise(
+    n_patients = n(),
+    mean_frequency = mean(frequency, na.rm = TRUE),
+    median_frequency = median(frequency, na.rm = TRUE),
+    sd_frequency = sd(frequency, na.rm = TRUE),
+    min_frequency = min(frequency, na.rm = TRUE),
+    max_frequency = max(frequency, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(cluster, desc(mean_frequency))
+
+cluster_mc_summary
+```
+
+Now we create a dataset focused only on the metaclusters of interes or the ones that may have a high frequency and we didnt notice
+```{r}
+mcs_of_interest <- c(
+  "cd8_tem_ra_cd57dim_senescent",
+  "cd4_quiescent_all_markers_low",
+  "cd4dim_pd1hi_tim3hi_exhausted"
+)
+
+# Check that these names exist exactly in the data
+setdiff(mcs_of_interest, unique(patient_mc_long$metacluster))
+
+focused_mc_summary <- patient_mc_long %>%
+  filter(metacluster %in% mcs_of_interest) %>%
+  group_by(cluster, metacluster) %>%
+  summarise(
+    n_patients = n(),
+    mean_frequency = mean(frequency, na.rm = TRUE),
+    median_frequency = median(frequency, na.rm = TRUE),
+    min_frequency = min(frequency, na.rm = TRUE),
+    max_frequency = max(frequency, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(metacluster, cluster)
+
+focused_mc_summary
+```
+
+```{r}
+ggplot(
+  focused_mc_summary,
+  aes(x = metacluster, y = mean_frequency, fill = as.factor(cluster))
+) +
+  geom_col(position = position_dodge(width = 0.8)) +
+  labs(
+    x = "Metacluster",
+    y = "Mean frequency (%)",
+    fill = "Patient cluster"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.minor = element_blank()
+  )
+```
+
+From this new information we can say that Cluster 3 shows high frequency/aubndance of the cd4dim_pd1hi_tim3hi_exhausted 
+Then for cluster 1 we see a dominance by cd8_tem_ra_cd57dim_senescent (54.84%), suggesting a strong CD8 TEMRA/senescent-like skewed immune profile.
+On the other hand, cluster 2 looks dominated by cd4_quiescent_all_markers_low (35.65%), with an intermediate contribution from cd8_tem_ra_cd57dim_senescent (25.87%).
+Cluster 3 contains only one patient and is dominated by cd4dim_pd1hi_tim3hi_exhausted, suggesting a single-patient outlier immune profile enriched in a PD1/TIM-3-high CD4dim metacluster.
+cd4_naive_ccr7hi_cd27_cd28 was present in both clusters and showed only a modest difference between clusters 1 and 2 of 10.56% in cluster 2 against 7.17% cluster 1.
+
+The focused bar plot confirmed that the three FlowSOM-derived patient clusters were mainly separated by three dominant metacluster-frequency patterns.
+
+For `cd4_quiescent_all_markers_low`, the mean frequency was highest in cluster 2, reaching almost 40%, intermediate in cluster 1 at around 20%, and almost absent in cluster 3. This suggests that cluster 2 is the patient group most enriched in this CD4 quiescent-like metacluster.
+
+For `cd4dim_pd1hi_tim3hi_exhausted`, the frequency was approximately 0% in clust ers 1 and 2, while cluster 3 showed a high frequency of approximately 75%. Since cluster 3 contains only one patient, this pattern should be interpreted as a single-patient outlier immune profile dominated by a PD1/TIM-3-high CD4dim metacluster, rather than as a robust group-level phenotype.
+
+For `cd8_tem_ra_cd57dim_senescent`, the mean frequency was highest in cluster 1, close to 60%, intermediate in cluster 2, around 30%, and nearly absent in cluster 3. This supports the interpretation that cluster 1 is characterized by a CD8 TEMRA/senescent-like dominant immune profile, while cluster 2 retains a moderate contribution from this metacluster.
+
+Overall, the focused bar plot suggests a gradient-like distinction between clusters 1 and 2, with cluster 1 being more CD8 TEMRA/senescent-like and cluster 2 being more CD4 quiescent-like. Cluster 3 differs qualitatively from both clusters because it is dominated by the `cd4dim_pd1hi_tim3hi_exhausted` metacluster and contains only one patient.
+
+Now we can continue and perform PCAs, we are gona use them on the FlowSOM MC frequencies to see if patients separate based on their immue metacluster frequency profiles.
+Afterwards we will color them based on the FlowSOM clusters and on the clinical data.
+
+However, before performing the PCAs there is an issue with the data. THe frequencies in the meta clusters sum up to 100 for each patient, so if one meta cluster goes up at least one other must go down mathematically, eventhough if biologically nothing has decreased in an absolute sense. This type of percentages are called compositional.
+This causes to think between patients for example in this case:
+
+Patient A:
+MC1 = 60%, MC2 = 40%
+
+Patient B:
+MC1 = 80%, MC2 = 20%
+
+that MC2 decrased, however it may be that only MC1 expanded and MC2 absolut count stayed similar.With percentages alone we can only know relative composition and not absolute cell count.
+So for a PCA distances, clustering and ordination should be transformed before using. I will therefore tranform them through CLR trasnformation (centered log-ratio transformation).
+That is because CLR helps deal with the fact that the data are proportions, making the PCA more appropriate.
+
+However CLR has an issue, due to CLR using logarithms it can not handle zeros. That is why we have to add a tiny pseudocount before transforming our data.
+
+CLR TRANSFORMATION:
+
+we separate frquencies to another separate matrix
+```{r}
+mc_frequency_raw <- patient_immune_tbl %>%
+  select(all_of(mc_frequency_cols))
+```
+
+we check for 0 values
+```{r}
+zero_check <- mc_frequency_raw %>%
+  summarise(
+    total_values = n() * ncol(.),
+    zero_values = sum(. == 0, na.rm = TRUE),
+    missing_values = sum(is.na(.))
+  )
+
+zero_check
+```
+We transform percentages to proportions, by instead of simply dividing by 100, dividing by each patient's total frequency. This is a much safer aproach because rows sum to approximately 100 but not always 100. And force each patient row to sum to 1.
+```{r}
+mc_frequency_prop <- mc_frequency_raw / rowSums(mc_frequency_raw, na.rm = TRUE)
+
+#checking row sums
+summary(rowSums(mc_frequency_prop, na.rm = TRUE))
+```
+All of them should sum 1 so min max and median should be 1.
+
+Due to CLR not being able to take 0 due to log(0) being undefined.
+A reasonable choice is to add half of the smallest non zero proportion.
+```{r}
+min_nonzero_prop <- min(as.matrix(mc_frequency_prop)[as.matrix(mc_frequency_prop) > 0], na.rm = TRUE)
+
+pseudocount <- min_nonzero_prop / 2
+
+pseudocount
+```
+
+Now we add the pseudocount and normalize the rows so that they sum up to 1 again
+```{r}
+mc_frequency_prop_pseudo <- mc_frequency_prop + pseudocount
+
+mc_frequency_prop_pseudo <- mc_frequency_prop_pseudo / rowSums(
+  mc_frequency_prop_pseudo,
+  na.rm = TRUE
+)
+
+
+#checking the wows aggain after pseudocount
+summary(rowSums(mc_frequency_prop_pseudo, na.rm = TRUE))
+```
+
+Now we can apply the CLR transformation. the CLR formula that we are going to apply is the following one:
+CLR(x_i) = log(x_i) - mean(log(x_1), log(x_2), ..., log(x_D))
+```{r}
+#CLR transform function
+clr_transform <- function(x) {
+  log_x <- log(x)
+  log_x - mean(log_x, na.rm = TRUE)
+}
+
+```
+
+```{r}
+#applying formula
+mc_frequency_clr <- mc_frequency_prop_pseudo %>%
+  as.matrix() %>%
+  t() %>%
+  apply(2, clr_transform) %>%
+  t() %>%
+  as.data.frame()
+
+#restoring the names of the columns
+colnames(mc_frequency_clr) <- mc_frequency_cols
+
+#inspecting result
+dim(mc_frequency_clr)
+```
+
+Verifying the result
+```{r}
+clr_row_sum_check <- rowSums(mc_frequency_clr)
+
+summary(clr_row_sum_check)
+```
+
+Now we can go back to having a patient table but with the metacluster values transformed
+```{r}
+patient_immune_clr_tbl <- patient_immune_tbl %>%
+  select(patient_row_id, patient_plot_id, cluster) %>%
+  bind_cols(mc_frequency_clr)
+
+patient_immune_clr_tbl
+```
+
+Now we can do the PCA
+```{r}
+pca_input_matrix <- patient_immune_clr_tbl %>%
+  select(all_of(mc_frequency_cols)) %>%
+  as.matrix()
+```
+
+```{r}
+pca_res <-prcomp(
+  pca_input_matrix,
+  center = TRUE,
+  scale. = FALSE
+)
+```
+
+Check the variance explained
+```{r}
+pca_variance <- tibble(
+  PC = paste0("PC", seq_along(pca_res$sdev)),
+  variance_explained = (pca_res$sdev^2) / sum(pca_res$sdev^2),
+  percent_variance = variance_explained * 100
+)
+```
+now we generate the PCA scores
+```{r}
+pca_scores <- as_tibble(pca_res$x) %>%
+  bind_cols(
+    patient_immune_clr_tbl %>%
+      select(patient_row_id, patient_plot_id, cluster)
+  ) %>%
+  mutate(cluster = as.factor(cluster))
+
+pca_scores
+```
+
+Now we can filally plot our PCA and we will colour it using the already existing FlowSOM patient clusters
+```{r}
+ggplot(pca_scores, aes(x = PC1, y = PC2, color = cluster, label = patient_plot_id)) +
+  geom_point(size = 3) +
+  geom_text(vjust = -0.8, size = 3, show.legend = FALSE) +
+  labs(
+    x = paste0("PC1 (", round(pca_variance$percent_variance[1], 1), "%)"),
+    y = paste0("PC2 (", round(pca_variance$percent_variance[2], 1), "%)"),
+    color = "Patient cluster"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.minor = element_blank()
+  )
+```
+
+PCA of CLR-transformed metacluster frequencies did not show a strong separation of the three FlowSOM-derived patient clusters, suggesting that the cluster structure is not fully captured by the first two principal components.
+
+PC1 and PC2 have enough variance_explained (3.368679e-01 and 2.589606e-01), however separation is sometimes not visible comparing between PC1 and PC2 so I'm going to try adding PC3 to the mixt.
+```{r}
+ggplot(pca_scores, aes(x = PC1, y = PC3, color = cluster, label = patient_plot_id)) +
+  geom_point(size = 3) +
+  geom_text(vjust = -0.8, size = 3, show.legend = FALSE) +
+  labs(
+    x = paste0("PC1 (", round(pca_variance$percent_variance[1], 1), "%)"),
+    y = paste0("PC3 (", round(pca_variance$percent_variance[3], 1), "%)"),
+    color = "Patient cluster"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.minor = element_blank()
+  )
+```
+We can see a 'phantom' tendency of cluster 2 tending to the negative values in the x and y scale and and for cluster 1 to do the opposite, however this is not a conclusion or causal analysis its only an exploratory analysis and subjective observation.
+However in a global analysis clusters are mixed and PCA does not strongly support global separation.
+
+Lets further inspect this finding by identifying which metaclusters drive PC1, PC2, and PC3.
+```{r}
+# PCA loadings
+pca_loadings <- as_tibble(
+  pca_res$rotation,
+  rownames = "metacluster"
+)
+
+pca_loadings %>%
+  select(metacluster, PC1, PC2, PC3) %>%
+  arrange(desc(abs(PC1)))
+```
+
+```{r}
+top_pc1_loadings <- pca_loadings %>%
+  select(metacluster, PC1) %>%
+  mutate(abs_loading = abs(PC1)) %>%
+  arrange(desc(abs_loading)) %>%
+  slice_head(n = 10)
+
+top_pc1_loadings
+```
+
+```{r}
+top_pc2_loadings <- pca_loadings %>%
+  select(metacluster, PC2) %>%
+  mutate(abs_loading = abs(PC2)) %>%
+  arrange(desc(abs_loading)) %>%
+  slice_head(n = 10)
+
+top_pc2_loadings
+```
+lets plot the top drivers for PC1 and PC2
+```{r}
+top_loadings <- pca_loadings %>%
+  select(metacluster, PC1, PC2) %>%
+  pivot_longer(
+    cols = c(PC1, PC2),
+    names_to = "PC",
+    values_to = "loading"
+  ) %>%
+  group_by(PC) %>%
+  slice_max(order_by = abs(loading), n = 10) %>%
+  ungroup()
+
+ggplot(top_loadings, aes(x = reorder(metacluster, loading), y = loading)) +
+  geom_col() +
+  coord_flip() +
+  facet_wrap(~ PC, scales = "free_y") +
+  labs(
+    x = "Metacluster",
+    y = "PCA loading"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+This table was used to interpret the PCA loadings. Positive loadings indicate metaclusters associated with patients positioned toward positive values of a principal component, whereas negative loadings indicate metaclusters associated with patients positioned toward negative values. Therefore, each principal component can be interpreted as a contrast between the metaclusters contributing most strongly in opposite directions.
+
+So we can see between which two profiles PC1 and PC2 separates patients.
+As we can see PC1 is mainly driven mainly by gd_t_tem_ra_cd45r_ahi_vd1 in the positive direction and cd4_naive_ccr7hi_cd27_cd28 in the negative.
+This suggests that PC1 captures a contrast between a γδ T-cell TEMRA-like Vδ1-associated profile and a CD4 naïve-like profile.
+
+
+On the other hand, for PC2 the two main meta clusters influencing it are cd4dim_pd1hi_tim3hi_exhausted to the positive side, this one remarkably contributes compared to the rest and to the PC1 by far more. For the negative gd_t_mixed_vd_vd2dim.
+The contribution of cd4dim_pd1hi_tim3hi_exhausted was particularly strong, consistent with the outlier profile observed in patient cluster 3.
+
+The patient × metacluster heatmap and focused bar plots showed clear differences in selected dominant metaclusters between the FlowSOM-derived patient clusters. In particular, cluster 1 was characterized by higher `cd8_tem_ra_cd57dim_senescent`, cluster 2 by higher `cd4_quiescent_all_markers_low`, and cluster 3 by high `cd4dim_pd1hi_tim3hi_exhausted`.
+
+However, the PCA showed a more mixed and dispersed patient distribution. This indicates that although specific metaclusters differ between patient clusters, the global 20-metacluster immune profiles do not separate into completely distinct groups along PC1 and PC2. Therefore, the FlowSOM patient clusters should be interpreted as exploratory immune-profile patterns rather than sharply separated or validated immunotypes.
+
+This difference is expected because the heatmap/bar plots focus on selected dominant metaclusters, whereas PCA summarizes variation across the full 20-metacluster composition.
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
