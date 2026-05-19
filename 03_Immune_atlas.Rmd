@@ -39,6 +39,9 @@ library(writexl)
 library(pheatmap)
 library(ggrepel)
 library(broom)
+library(patchwork)
+library(uwot)
+library(tidyverse)
 ```
 
 The goal of the immune atlas is to properly describe the immune landscape reported by FlowSOM meta clusters, biologically annotated those meta clusters, and visualize how the 15 patients distribute across those different immune states.
@@ -83,6 +86,7 @@ We proceed to creat a heatmap for the for the 20 meta clusters in respect to the
 
 First creating an specific table to plot the heatmap
 ```{r}
+
 patient_immune_tbl <- analysis_qc_deidentified %>%
   as_tibble() %>%
   mutate(
@@ -90,6 +94,7 @@ patient_immune_tbl <- analysis_qc_deidentified %>%
     patient_plot_id = paste0("P", stringr::str_pad(patient_row_id, width = 2, pad = "0"))
   ) %>%
   select(
+    codigo_interno,
     patient_row_id,
     patient_plot_id,
     cluster,
@@ -116,7 +121,7 @@ head(patient_mc_long)
 Ploting the raw frequencie heatmap (Patient x FlowSOM metacluster frequency heatmap), patients being frouped by the FlowSOM derived patient cluster.
 
 ```{r, fig.crop=FALSE}
-ggplot(patient_mc_long, aes(x = metacluster, y = patient_plot_id, fill = frequency)) +
+ggplot(patient_mc_long, aes(x = metacluster, y = codigo_interno, fill = frequency)) +
   geom_tile(color = "white", linewidth = 0.2) +
   facet_grid(cluster ~ ., scales = "free_y", space = "free_y") +
   labs(
@@ -126,7 +131,7 @@ ggplot(patient_mc_long, aes(x = metacluster, y = patient_plot_id, fill = frequen
   ) +
   theme_minimal(base_size = 11) +
   theme(
-    axis.text.x = element_text(angle = 90, hjust = 1),
+    axis.text.x = element_text(angle = 45, hjust = 1),
     panel.grid = element_blank(),
     plot.margin = margin(t = 25, r = 0, b = 0, l = 0)
     
@@ -161,7 +166,7 @@ mcs_of_interest <- c(
   "cd4dim_pd1hi_tim3hi_exhausted"
 )
 
-# Check that these names exist exactly in the data
+#checking that these names exist exactly in the data
 setdiff(mcs_of_interest, unique(patient_mc_long$metacluster))
 
 focused_mc_summary <- patient_mc_long %>%
@@ -234,7 +239,7 @@ However CLR has an issue, due to CLR using logarithms it can not handle zeros. T
 
 CLR TRANSFORMATION:
 
-we separate frquencies to another separate matrix
+we separate frequencies to another separate matrix
 ```{r}
 mc_frequency_raw <- patient_immune_tbl %>%
   select(all_of(mc_frequency_cols))
@@ -321,7 +326,7 @@ summary(clr_row_sum_check)
 Now we can go back to having a patient table but with the metacluster values transformed
 ```{r}
 patient_immune_clr_tbl <- patient_immune_tbl %>%
-  select(patient_row_id, patient_plot_id, cluster) %>%
+  select(patient_row_id, patient_plot_id, cluster, codigo_interno) %>%
   bind_cols(mc_frequency_clr)
 
 patient_immune_clr_tbl
@@ -329,12 +334,14 @@ patient_immune_clr_tbl
 
 Now we can do the PCA
 ```{r}
+#creating the input for the PCA algorithm
 pca_input_matrix <- patient_immune_clr_tbl %>%
   select(all_of(mc_frequency_cols)) %>%
   as.matrix()
 ```
 
 ```{r}
+#Running the PCA
 pca_res <-prcomp(
   pca_input_matrix,
   center = TRUE,
@@ -350,21 +357,22 @@ pca_variance <- tibble(
   percent_variance = variance_explained * 100
 )
 ```
+
 now we generate the PCA scores
 ```{r}
 pca_scores <- as_tibble(pca_res$x) %>%
   bind_cols(
     patient_immune_clr_tbl %>%
-      select(patient_row_id, patient_plot_id, cluster)
+      select(patient_row_id, patient_plot_id, cluster, codigo_interno)
   ) %>%
   mutate(cluster = as.factor(cluster))
 
 pca_scores
 ```
 
-Now we can filally plot our PCA and we will colour it using the already existing FlowSOM patient clusters
+Now we can finally plot our PCA and we will colour it using the already existing FlowSOM patient clusters
 ```{r}
-ggplot(pca_scores, aes(x = PC1, y = PC2, color = cluster, label = patient_plot_id)) +
+ggplot(pca_scores, aes(x = PC1, y = PC2, color = cluster, label = codigo_interno)) +
   geom_point(size = 3) +
   geom_text(vjust = -0.8, size = 3, show.legend = FALSE) +
   labs(
@@ -382,7 +390,7 @@ PCA of CLR-transformed metacluster frequencies did not show a strong separation 
 
 PC1 and PC2 have enough variance_explained (3.368679e-01 and 2.589606e-01), however separation is sometimes not visible comparing between PC1 and PC2 so I'm going to try adding PC3 to the mixt.
 ```{r}
-ggplot(pca_scores, aes(x = PC1, y = PC3, color = cluster, label = patient_plot_id)) +
+ggplot(pca_scores, aes(x = PC1, y = PC3, color = cluster, label = codigo_interno)) +
   geom_point(size = 3) +
   geom_text(vjust = -0.8, size = 3, show.legend = FALSE) +
   labs(
@@ -411,6 +419,7 @@ pca_loadings %>%
   arrange(desc(abs(PC1)))
 ```
 
+the top ones we select them in absolute values since PCA joins the meta clusters that affect the most moving the value positively and negatively, so we want the top of both ways to see which ones affect the most
 ```{r}
 top_pc1_loadings <- pca_loadings %>%
   select(metacluster, PC1) %>%
@@ -470,46 +479,324 @@ However, the PCA showed a more mixed and dispersed patient distribution. This in
 
 This difference is expected because the heatmap/bar plots focus on selected dominant metaclusters, whereas PCA summarizes variation across the full 20-metacluster composition.
 
+Due to this dispersion I will then now proceed to run a sanity check. We are going to perform hierarchical clustering. Which is an unsupervised patient grouping method. This method creates a dendogram showcasing which patients have a similar immune profile in global.
+The main goal of this is not to replace the already existing "Cluster" variable, but to check whether an independent clustering method gives patient groupings similar to the FlowSOM ones.
+
+If it matches it would help support the FlowSOM cluster structure. However, if it did not match it would mean that FlowSOM clusters capture selected dominant meta cluster differences, but the global profile of the 20 meta clusters is more mixed. 
+This analysis is exploratory and was not used to redefine patient groups.
+
+Lets first prepare the clustering input
 ```{r}
+hc_input_matrix <- patient_immune_clr_tbl %>%
+  select(all_of(mc_frequency_cols)) %>%
+  as.matrix()
+
+rownames(hc_input_matrix) <- patient_immune_clr_tbl$codigo_interno
+
+dim(hc_input_matrix)
+```
+
+Now we can compute the distances and the clustering
+```{r}
+#Euclidean distance on CLR-transformed immune profiles
+patient_dist <- dist(hc_input_matrix, method = "euclidean")
+
+#hierarchical clustering
+hc_res <- hclust(patient_dist, method = "ward.D2")
+```
+
+Ploting the dendrogram
+```{r}
+plot(
+  hc_res,
+  main = "Hierarchical clustering of CLR immune profiles",
+  xlab = "Patient",
+  sub = "",
+  cex = 0.8
+)
+
+rect.hclust(hc_res, k = 3, border = "gray40")
+```
+
+
+Comparing the hierarchical clusters with the existing FlowSOM clusters
+```{r}
+hc_patient_groups <- tibble(
+  codigo_interno = names(cutree(hc_res, k = 3)),
+  hc_cluster = as.factor(cutree(hc_res, k = 3))
+) %>%
+  left_join(
+    patient_immune_clr_tbl %>%
+      select(codigo_interno, flowsom_patient_cluster = cluster),
+    by = "codigo_interno"
+  ) %>%
+  mutate(
+    flowsom_patient_cluster = as.factor(flowsom_patient_cluster)
+  )
+
+hc_patient_groups
+```
+Now we visualize with a comparison table or with a matrix
+```{r}
+hc_comparison_table <- hc_patient_groups %>%
+  count(flowsom_patient_cluster, hc_cluster)
+
+hc_comparison_table
+```
+
+```{r}
+table(
+  FlowSOM_cluster = hc_patient_groups$flowsom_patient_cluster,
+  Hierarchical_cluster = hc_patient_groups$hc_cluster
+)
+```
+
+So we can observe that the hierarchical clustering fitted every patient onto cluster 1 and left 2 patients out into one cluster each one. consequently we can conclude that hierarchical clustering did not fully reproduce the FlowSOM-derived patient clusters, suggesting that the patient clusters capture selected metacluster-dominant patterns rather than sharply separated global immune-profile groups.
+
+To continue with our descriptive analysis we now can use clinical metadata overlays on the PCA to paint the samples and see if theres any information worth distinguishing.
+
+Which clinical variables do we have available?
+```{r}
+names(patient_metadata)
+```
+We now check the missingness to choose the best variables to test
+```{r}
+patient_metadata %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "variable",
+    values_to = "n_missing"
+  ) %>%
+  arrange(n_missing)
+```
+We now join the clinical data to the pca scores
+```{r}
+pca_scores_metadata <- pca_scores %>%
+  left_join(
+    patient_metadata %>% select(-cluster),
+    by = "codigo_interno"
+  )
+```
+
+Checking the fusion
+```{r}
+anti_join(pca_scores, patient_metadata, by = "codigo_interno")
+anti_join(patient_metadata, pca_scores, by = "codigo_interno")
+```
+Now we can do an exploratory analysis on how immune 
+```{r}
+pca_scores_metadata_plot <- pca_scores_metadata %>%
+  mutate(
+    sexo = as.factor(sexo),
+    lugar_de_infeccion = as.factor(lugar_de_infeccion),
+    tipo_de_infeccion = as.factor(tipo_de_infeccion),
+    numero_intervenciones_n = as.factor(numero_intervenciones_n),
+    lateralidad = as.factor(lateralidad),
+    il6_pg_m_l = il6_pg_m_l
+  )
+
+p_sexo <- ggplot(pca_scores_metadata_plot, aes(x = PC1, y = PC2, color = sexo, label = codigo_interno)) +
+  geom_point(size = 3) +
+  geom_text(vjust = -0.8, size = 3, show.legend = FALSE) +
+  labs(
+    x = paste0("PC1 (", round(pca_variance$percent_variance[1], 1), "%)"),
+    y = paste0("PC2 (", round(pca_variance$percent_variance[2], 1), "%)"),
+    color = "sex"
+  ) +
+  theme_minimal(base_size = 11)
+
+
+p_lugar <- ggplot(pca_scores_metadata_plot, aes(x = PC1, y = PC2, color = lugar_de_infeccion, label = codigo_interno)) +
+  geom_point(size = 3) +
+  geom_text(vjust = -0.8, size = 3, show.legend = FALSE) +
+  labs(
+    x = paste0("PC1 (", round(pca_variance$percent_variance[1], 1), "%)"),
+    y = paste0("PC2 (", round(pca_variance$percent_variance[2], 1), "%)"),
+    color = "place of infection"
+  ) +
+  theme_minimal(base_size = 11)
+
+p_tipo <- ggplot(pca_scores_metadata_plot, aes(x = PC1, y = PC2, color = tipo_de_infeccion, label = codigo_interno)) +
+  geom_point(size = 3) +
+  geom_text(vjust = -0.8, size = 3, show.legend = FALSE) +
+  labs(
+    x = paste0("PC1 (", round(pca_variance$percent_variance[1], 1), "%)"),
+    y = paste0("PC2 (", round(pca_variance$percent_variance[2], 1), "%)"),
+    color = "type of infection"
+  ) +
+  theme_minimal(base_size = 11)
+
+p_intervenciones <- ggplot(pca_scores_metadata_plot, aes(x = PC1, y = PC2, color = numero_intervenciones_n, label = codigo_interno)) +
+  geom_point(size = 3) +
+  geom_text(vjust = -0.8, size = 3, show.legend = FALSE) +
+  labs(
+    x = paste0("PC1 (", round(pca_variance$percent_variance[1], 1), "%)"),
+    y = paste0("PC2 (", round(pca_variance$percent_variance[2], 1), "%)"),
+    color = "number of interventions"
+  ) +
+  theme_minimal(base_size = 11)
 
 ```
 
 ```{r}
+(p_sexo + p_lugar) /
+(p_tipo + p_intervenciones)
+```
+In general no big distinctions can be found, as an example are the four figures above. Despite that there are two really subtle cases in which something could be commented.
+
+```{r}
+lateralidad_p <- ggplot(pca_scores_metadata_plot, aes(x = PC1, y = PC2, color = lateralidad, label = codigo_interno)) +
+  geom_point(size = 3) +
+  geom_text(vjust = -0.8, size = 3, show.legend = FALSE) +
+  labs(
+    x = paste0("PC1 (", round(pca_variance$percent_variance[1], 1), "%)"),
+    y = paste0("PC2 (", round(pca_variance$percent_variance[2], 1), "%)"),
+    color = "lateralidad"
+  ) +
+  theme_minimal(base_size = 11)
+
+il6_p <- ggplot(pca_scores_metadata_plot, aes(x = PC1, y = PC2, color = il6_pg_m_l, label = codigo_interno)) +
+  geom_point(size = 3) +
+  geom_text(vjust = -0.8, size = 3, show.legend = FALSE) +
+  labs(
+    x = paste0("PC1 (", round(pca_variance$percent_variance[1], 1), "%)"),
+    y = paste0("PC2 (", round(pca_variance$percent_variance[2], 1), "%)"),
+    color = "il6_pg_m_l"
+  ) +
+  theme_minimal(base_size = 11)
+
+(lateralidad_p + il6_p)
+```
+A weak visual trend was observed in the case of laterality that the patients with "Derecha" (right) tend to the left, the only patient with "ambas" (both) falls around the middle and the ones with "izquierda" (left) fall more to the l¡right in respect to PC1, however this is a really rough extrapolation and should be interpreted cautiously. 
+
+In the case of il6_pg_m_l we can see that low values cluster in the center, while higher ones disperse in all directions.
+
+Now, and finally, to give another point of view and keep on going with our exploratory visualization we can perform a UMAP, an algorithm with the same aim as the PCA but with a different approach. In this case it performs a dimensionality reduction trying to keep the neighbors.
+
+
+We start by preparing the input to the UMAP
+```{r}
+umap_input_matrix <- patient_immune_clr_tbl %>%
+  select(all_of(mc_frequency_cols)) %>%
+  as.matrix()
+
+rownames(umap_input_matrix) <- patient_immune_clr_tbl$codigo_interno
+
+dim(umap_input_matrix)
+```
+
+Now we run the UMAP
+```{r}
+set.seed(123) #setting a seed because contrary to the parametric UMAP, normal UMAP is not replicable
+
+umap_res <- uwot::umap(
+  umap_input_matrix,
+  n_neighbors = 4, #we have small sample size
+  min_dist = 0.3,
+  metric = "euclidean", #apropiate for clr transformation
+  scale = FALSE #data is already trasnformed with clr
+)
+```
+
+Creating the UMAP plotting table
+```{r}
+umap_scores <- as_tibble(umap_res, .name_repair = "minimal") %>%
+  rename(
+    UMAP1 = 1,
+    UMAP2 = 2
+  ) %>%
+  bind_cols(
+    patient_immune_clr_tbl %>%
+      select(codigo_interno, cluster)
+  ) %>%
+  mutate(
+    cluster = as.factor(cluster)
+  )
+
+umap_scores
+```
+
+Plotting the UMAP colored by FlowSOM clusters
+```{r}
+ggplot(umap_scores, aes(x = UMAP1, y = UMAP2, color = cluster, label = codigo_interno)) +
+  geom_point(size = 3) +
+  geom_text(vjust = -0.8, size = 3, show.legend = FALSE) +
+  labs(
+    x = "UMAP1",
+    y = "UMAP2",
+    color = "Patient cluster"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.minor = element_blank()
+  )
+```
+Again we can observe that when the whole immune landscape is used to classify all samples appear mixed
+
+We can join with the clinical metadata to check the "lateralidad" and "il6_pg_m_l" variables like before.
+```{r}
+umap_scores_metadata <- umap_scores %>%
+  left_join(
+    patient_metadata %>% select(-cluster),
+    by = "codigo_interno"
+  )
 
 ```
 
 ```{r}
-
+ggplot(umap_scores_metadata, aes(x = UMAP1, y = UMAP2, color = il6_pg_m_l)) +
+  geom_point(size = 3.5, alpha = 0.9) +
+  labs(
+    x = "UMAP1",
+    y = "UMAP2",
+    color = "IL-6\npg/mL"
+  ) +
+  theme_minimal(base_size = 11)
 ```
+For "il6_pg_m_l" the UMAP overlay did not show a clear or consistent visual pattern
 
 ```{r}
-
+ggplot(umap_scores_metadata, aes(x = UMAP1, y = UMAP2, color = lateralidad)) +
+  geom_point(size = 3.5, alpha = 0.9) +
+  labs(
+    x = "UMAP1",
+    y = "UMAP2",
+    color = "IL-6\npg/mL"
+  ) +
+  theme_minimal(base_size = 11)
 ```
+In the case of "lateralidad", we can again see a visual separation between "Derecha" (right) and "Izquierda" (left). "Derecha" tending to occupy the lower region of the UMAP spac, and "Izquierda" in the upper one. 
+This observation should be read with caution, since there is no immediate biological rationale that would cause to expect immune profile structure to be driven by the laterality of the injure. This could be due to the instability of UMAP in a cohort of only 15 patients however it is courious to see that it also happened in the PCA.
 
+
+
+Overall, this immune-atlas analysis describes the patient-level immune landscape captured by FlowSOM metacluster frequencies. The FlowSOM-derived patient clusters were mainly characterized by differences in a limited number of dominant metaclusters rather than by complete separation across the full immune profile. Cluster 1 showed a CD8 TEMRA/senescent-like dominant pattern, mainly driven by `cd8_tem_ra_cd57dim_senescent`; cluster 2 showed a more CD4 quiescent-like mixed profile, mainly associated with `cd4_quiescent_all_markers_low`; and cluster 3 consisted of a single-patient outlier profile dominated by `cd4dim_pd1hi_tim3hi_exhausted`.
+
+After CLR transformation of the compositional metacluster-frequency data, PCA and UMAP showed that patients were globally mixed rather than sharply separated into stable immune groups. Hierarchical clustering also did not fully reproduce the FlowSOM-derived patient clusters, supporting the interpretation that these clusters reflect exploratory immune-profile patterns rather than validated immunotypes. Clinical metadata overlays did not reveal strong or consistent associations with the main immune-profile axes. Weak visual trends, such as the apparent separation by `lateralidad`, were considered hypothesis-generating only and should be interpreted with caution due to the small cohort size and unbalanced categories.
+
+Therefore, this section provides a descriptive FlowSOM-based immune atlas of the cohort. The results identify dominant immune profile patterns and candidate metacluster signatures, but they should not be interpreted as definitive clinical biomarkers, causal mechanisms, or validated patient subtypes. Further analysis with larger cohorts and formal statistical testing would be required to evaluate clinical associations.
+The main following steps would be an analysis involving a cohort quality audit, a global map of the patients and perhaps a differential abundance.
+
+
+Saving the important objects
 ```{r}
+immune_atlas_results <- list(
+  patient_immune_tbl = patient_immune_tbl,
+  patient_mc_long = patient_mc_long,
+  cluster_mc_summary = cluster_mc_summary,
+  focused_mc_summary = focused_mc_summary,
+  mc_frequency_clr = mc_frequency_clr,
+  patient_immune_clr_tbl = patient_immune_clr_tbl,
+  pca_res = pca_res,
+  pca_scores = pca_scores,
+  pca_variance = pca_variance,
+  pca_loadings = pca_loadings,
+  umap_scores = umap_scores
+)
 
-```
-
-```{r}
-
-```
-
-```{r}
-
-```
-
-```{r}
-
-```
-
-```{r}
-
-```
-
-```{r}
-
-```
-
-```{r}
-
+saveRDS(
+  immune_atlas_results,
+  "trauma_immune_atlas_results_bundle.rds"
+)
 ```
